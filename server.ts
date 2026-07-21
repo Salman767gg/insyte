@@ -484,6 +484,7 @@ const PORT = 3000;
 
 // Allow requests from the Vercel frontend + local dev
 const ALLOWED_ORIGINS = [
+  "https://insyte-xi.vercel.app",
   "https://insyte-1-4.vercel.app",
   "http://localhost:3000",
   "http://localhost:5173"
