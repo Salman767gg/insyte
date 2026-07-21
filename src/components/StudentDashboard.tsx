@@ -1,0 +1,1953 @@
+import React, { useState, useEffect, useRef } from "react";
+import { motion, AnimatePresence } from "motion/react";
+import {
+  BookOpen, Award, MessageSquare, Calendar, Sparkles, Send,
+  ChevronRight, Trophy, Bell, Clock, LogOut, CheckCircle2,
+  List, ShieldAlert, ArrowLeft, RefreshCw, Star, Info, Settings,
+  Video, Presentation, Globe, ExternalLink, Search, Mail as MailLucide, UserPlus, Menu
+} from "lucide-react";
+import {
+  UserProfile, ClassCommunity, Lesson, TaskItem,
+  TaskSubmission, Announcement, ChatMessage, ClassEvent,
+  Mail, AppNotification
+} from "../types";
+import { Language, Theme, getTranslation } from "../translations";
+import { InteractiveCalendar } from "./InteractiveCalendar";
+import { SettingsTab } from "./SettingsTab";
+import { NavbarControls } from "./NavbarControls";
+import { NotificationBell, StreakBadge } from "./HeaderExtras";
+import { MailPanel } from "./MailPanel";
+import { XpBar, Confetti, LevelUpToast } from "./Gamify";
+import { getClassColors } from "../utils/colorHelper";
+import { api } from "../api";
+
+interface StudentDashboardProps {
+  currentStudent: UserProfile;
+  classes: ClassCommunity[];
+  lessons: Lesson[];
+  tasks: TaskItem[];
+  announcements: Announcement[];
+  chatMessages: ChatMessage[];
+  events: ClassEvent[];
+  submissions: TaskSubmission[];
+  allStudents: UserProfile[];
+  allTeachers: UserProfile[];
+  mails: Mail[];
+  notifications: AppNotification[];
+  onLogOut: () => void;
+  onSendMessage: (classId: string, text: string) => void;
+  onAddXp: (xpAmount: number) => void;
+  onSubmitTask: (submission: Omit<TaskSubmission, "id" | "submittedAt">) => void;
+  onLeaveClass: (classId: string) => void;
+  onJoinClass: (code: string) => Promise<string | null>;
+  onSendMail: (toId: string, subject: string, body: string) => Promise<string | null>;
+  onMarkMailRead: (mailId: string) => void;
+  onMarkNotificationsRead: () => void;
+  onUpdateAvatar: (dataUrl: string) => Promise<string | null>;
+  language: Language;
+  setLanguage: (lang: Language) => void;
+  theme: Theme;
+  setTheme: (th: Theme) => void;
+}
+
+export const StudentDashboard: React.FC<StudentDashboardProps> = ({
+  currentStudent,
+  classes,
+  lessons,
+  tasks,
+  announcements,
+  chatMessages,
+  events,
+  submissions,
+  allStudents,
+  allTeachers,
+  mails,
+  notifications,
+  onLogOut,
+  onSendMessage,
+  onAddXp,
+  onSubmitTask,
+  onLeaveClass,
+  onJoinClass,
+  onSendMail,
+  onMarkMailRead,
+  onMarkNotificationsRead,
+  onUpdateAvatar,
+  language,
+  setLanguage,
+  theme,
+  setTheme
+}) => {
+  const t = getTranslation(language);
+
+  const getYoutubeEmbedUrl = (url?: string) => {
+    if (!url) return "";
+    // Pull the 11-char video id out of any YouTube URL form (watch, youtu.be,
+    // shorts, embed) and always frame the privacy-friendly nocookie embed —
+    // a raw watch URL sends X-Frame-Options and shows "refused to connect".
+    const regExp = /(?:youtu\.be\/|\/shorts\/|v\/|u\/\w\/|embed\/|watch\?v=|\&v=)([\w-]{11})/;
+    const match = url.match(regExp);
+    if (match && match[1]) {
+      return `https://www.youtube-nocookie.com/embed/${match[1]}`;
+    }
+    return url;
+  };
+
+  // Toast notifications state
+  const [notification, setNotification] = useState<{ message: string; type: "success" | "info" } | null>(null);
+
+  const showNotification = (message: string, type: "success" | "info" = "success") => {
+    setNotification({ message, type });
+    setTimeout(() => {
+      setNotification(null);
+    }, 4000);
+  };
+
+  // Leave-class confirmation state
+  const [leaveConfirm, setLeaveConfirm] = useState<ClassCommunity | null>(null);
+
+  const confirmLeaveClass = () => {
+    if (!leaveConfirm) return;
+    const leaving = leaveConfirm;
+    const remaining = studentClasses.filter(c => c.id !== leaving.id);
+    // If we're leaving the active class, switch to another enrolled class (or none)
+    if (activeClass?.id === leaving.id) {
+      setActiveClass(remaining[0] || null);
+      setSelectedLesson(null);
+      setSelectedTask(null);
+    }
+    onLeaveClass(leaving.id);
+    setLeaveConfirm(null);
+    showNotification(`${t.leftClass} ${getGradeAndSubject(leaving.name).subject}`, "info");
+  };
+
+  // Navigation & View States
+  const studentClasses = classes.filter(c => currentStudent?.joinedClasses?.includes(c.id) ?? false);
+  const [activeClass, setActiveClass] = useState<ClassCommunity | null>(studentClasses[0] || null);
+
+  const getGradeAndSubject = (name: string) => {
+    if (name.includes(" - ")) {
+      const parts = name.split(" - ");
+      return { grade: parts[0].trim(), subject: parts[1].trim() };
+    }
+    return { grade: name.trim(), subject: "General" };
+  };
+
+  const classesByGrade: Record<string, ClassCommunity[]> = {};
+  studentClasses.forEach(cl => {
+    const { grade } = getGradeAndSubject(cl.name);
+    if (!classesByGrade[grade]) {
+      classesByGrade[grade] = [];
+    }
+    classesByGrade[grade].push(cl);
+  });
+
+  const grades = Object.keys(classesByGrade);
+  const activeGrade = activeClass ? getGradeAndSubject(activeClass.name).grade : (grades[0] || "");
+  const activeGradeClasses = classesByGrade[activeGrade] || [];
+
+  const activeColors = getClassColors(activeClass?.color);
+  const [activeTab, setActiveTab] = useState<"dashboard" | "lessons" | "tasks" | "chat" | "ai" | "calendar" | "mail" | "settings">("dashboard");
+
+  // Join-class modal state
+  const [joinOpen, setJoinOpen] = useState(false);
+  const [joinCode, setJoinCode] = useState("");
+  const [joinError, setJoinError] = useState<string | null>(null);
+  const [joining, setJoining] = useState(false);
+
+  const handleJoinSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!joinCode.trim() || joining) return;
+    setJoining(true);
+    setJoinError(null);
+    const err = await onJoinClass(joinCode.trim());
+    setJoining(false);
+    if (err) {
+      setJoinError(err);
+    } else {
+      setJoinOpen(false);
+      setJoinCode("");
+      showNotification(t.joinedClassSuccess);
+    }
+  };
+
+  const unreadMailCount = mails.filter(m => m.toId === currentStudent.id && !m.read).length;
+
+  // Which panel to show when the student hasn't joined any class yet
+  const [noClassTab, setNoClassTab] = useState<"home" | "mail" | "settings">("home");
+
+  // Mobile nav drawer (the hamburger opens the left rail)
+  const [menuOpen, setMenuOpen] = useState(false);
+
+  // Level-up celebration: fire confetti + banner when the level number rises
+  const [confettiTick, setConfettiTick] = useState(0);
+  const [levelUpTo, setLevelUpTo] = useState<number | null>(null);
+  const prevLevelRef = useRef(currentStudent.level);
+  useEffect(() => {
+    if (currentStudent.level > prevLevelRef.current) {
+      setConfettiTick(t => t + 1);
+      setLevelUpTo(currentStudent.level);
+    }
+    prevLevelRef.current = currentStudent.level;
+  }, [currentStudent.level]);
+
+  // Subview Details States
+  const [selectedLesson, setSelectedLesson] = useState<Lesson | null>(null);
+  const [selectedTask, setSelectedTask] = useState<TaskItem | null>(null);
+
+  // Search query states
+  const [lessonSearch, setLessonSearch] = useState("");
+  const [taskSearch, setTaskSearch] = useState("");
+  const [announcementSearch, setAnnouncementSearch] = useState("");
+
+  // Homework submission input state
+  const [homeworkText, setHomeworkText] = useState("");
+  const [submittingTask, setSubmittingTask] = useState(false);
+
+  // Drag and Drop Matcher State
+  const [draggedItem, setDraggedItem] = useState<string | null>(null);
+  const [matchedPairings, setMatchedPairings] = useState<Record<string, string>>({}); // Target -> DraggedItem
+  const [dragDropFeedback, setDragDropFeedback] = useState<{ success?: boolean; text: string } | null>(null);
+
+  // Chat message input state
+  const [chatInput, setChatInput] = useState("");
+  const chatBottomRef = useRef<HTMLDivElement>(null);
+
+  // AI Tutor state
+  const [aiChat, setAiChat] = useState<Array<{ role: "user" | "assistant"; text: string }>>([
+    {
+      role: "assistant",
+      text: `${t.aiGreetingHi} **${currentStudent.name}**! ${t.aiGreetingBody}`
+    }
+  ]);
+  const [aiInput, setAiInput] = useState("");
+  const [aiLoading, setAiLoading] = useState(false);
+  const aiBottomRef = useRef<HTMLDivElement>(null);
+
+  // When classes list changes (e.g. just joined first class), ensure one is active
+  useEffect(() => {
+    if (!activeClass && studentClasses.length > 0) {
+      setActiveClass(studentClasses[0]);
+    }
+  }, [classes, currentStudent.joinedClasses]);
+
+  // Auto scroll to chat bottoms
+  useEffect(() => {
+    if (activeTab === "chat") {
+      chatBottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    } else if (activeTab === "ai") {
+      aiBottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [activeTab, chatMessages, aiChat]);
+
+  // Handle Drag and Drop Matcher
+  const handleDragStart = (item: string) => {
+    setDraggedItem(item);
+  };
+
+  const handleDrop = (zone: string) => {
+    if (!draggedItem || !selectedTask?.correctPairing) return;
+    
+    // Set matching pairing
+    setMatchedPairings(prev => ({
+      ...prev,
+      [zone]: draggedItem
+    }));
+    setDraggedItem(null);
+  };
+
+  const handleResetDragDrop = () => {
+    setMatchedPairings({});
+    setDragDropFeedback(null);
+  };
+
+  const handleCheckDragDrop = () => {
+    if (!selectedTask || !selectedTask.correctPairing) return;
+    
+    const targets = selectedTask.dropZones || [];
+    let allCorrect = true;
+    
+    for (const target of targets) {
+      // Find what item was dropped into this target
+      const droppedItem = matchedPairings[target];
+      // Check correct pairing
+      const expectedItem = Object.keys(selectedTask.correctPairing).find(
+        key => selectedTask.correctPairing?.[key] === target
+      );
+      
+      if (droppedItem !== expectedItem) {
+        allCorrect = false;
+        break;
+      }
+    }
+
+    if (allCorrect) {
+      setDragDropFeedback({
+        success: true,
+        text: `${t.dragMatchSuccess} +${selectedTask.rewardXp} XP!`
+      });
+      
+      // Submit submission
+      onSubmitTask({
+        taskId: selectedTask.id,
+        taskTitle: selectedTask.title,
+        studentId: currentStudent.id,
+        studentName: currentStudent.name,
+        studentAvatar: currentStudent.avatar,
+        content: JSON.stringify(matchedPairings),
+        isGraded: true,
+        scoreXpEarned: selectedTask.rewardXp
+      });
+      onAddXp(selectedTask.rewardXp);
+    } else {
+      setDragDropFeedback({
+        success: false,
+        text: t.dragMatchFail
+      });
+    }
+  };
+
+  // Quiz answers: questionIndex -> chosen optionIndex
+  const [quizAnswers, setQuizAnswers] = useState<Record<number, number>>({});
+  const [quizResult, setQuizResult] = useState<{ correct: number; total: number; xp: number } | null>(null);
+  // Fresh quiz state whenever a different task is opened
+  useEffect(() => {
+    setQuizAnswers({});
+    setQuizResult(null);
+  }, [selectedTask?.id]);
+
+  const handleSubmitQuiz = () => {
+    if (!selectedTask?.quizQuestions) return;
+    const qs = selectedTask.quizQuestions;
+    let correct = 0;
+    qs.forEach((q, i) => { if (quizAnswers[i] === q.correctIndex) correct++; });
+    const xp = Math.round((correct / qs.length) * selectedTask.rewardXp);
+    setQuizResult({ correct, total: qs.length, xp });
+
+    onSubmitTask({
+      taskId: selectedTask.id,
+      taskTitle: selectedTask.title,
+      studentId: currentStudent.id,
+      studentName: currentStudent.name,
+      studentAvatar: currentStudent.avatar,
+      content: `Quiz: ${correct}/${qs.length} correct`,
+      isGraded: true,
+      scoreXpEarned: xp
+    });
+    if (xp > 0) onAddXp(xp);
+    showNotification(`${t.quizScore} ${correct}/${qs.length} — +${xp} XP`);
+  };
+
+  // Submit Text Homework Task
+  const handleTextHomeworkSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!selectedTask || !homeworkText.trim()) return;
+
+    setSubmittingTask(true);
+    
+    setTimeout(() => {
+      onSubmitTask({
+        taskId: selectedTask.id,
+        taskTitle: selectedTask.title,
+        studentId: currentStudent.id,
+        studentName: currentStudent.name,
+        studentAvatar: currentStudent.avatar,
+        content: homeworkText.trim(),
+        isGraded: false // Teacher needs to grade text submissions
+      });
+
+      setHomeworkText("");
+      setSubmittingTask(false);
+      setSelectedTask(null);
+      // Let student know they submitted
+      showNotification(`${t.homeworkSubmitted} ${selectedTask.rewardXp} XP.`);
+    }, 800);
+  };
+
+  // Chat message send
+  const handleSendChat = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!activeClass || !chatInput.trim()) return;
+    onSendMessage(activeClass.id, chatInput.trim());
+    setChatInput("");
+  };
+
+  // Ask AI Study Buddy
+  const handleAskAi = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!aiInput.trim() || aiLoading) return;
+
+    const userMessage = aiInput.trim();
+    setAiInput("");
+    setAiChat(prev => [...prev, { role: "user", text: userMessage }]);
+    setAiLoading(true);
+
+    // Formulate a student profile-context prompt for Gemini
+    const currentClassLessons = lessons.filter(l => l.classId === activeClass?.id);
+    const currentClassTasks = tasks.filter(t => t.classId === activeClass?.id);
+    const openTasks = currentClassTasks.filter(t => !submissions.some(s => s.taskId === t.id && s.studentId === currentStudent.id));
+
+    const systemPrompt = `You are **Insyte AI**, a helpful study tutor for an educational platform called Insyte.
+You help students with studies, tasks, lessons, and motivate them.
+
+**Current Student Context:**
+- Student Name: ${currentStudent.name}
+- Level: ${currentStudent.level}
+- XP Points: ${currentStudent.xp}
+- Rank: ${currentStudent.rank}
+${activeClass ? `- Current Subject: ${activeClass.name}` : ''}
+- Enrolled Lessons: ${currentClassLessons.map(l => l.title).join(", ") || 'None'}
+- Open/Pending Homework: ${openTasks.map(t => `${t.title} (Reward: ${t.rewardXp} XP)`).join(", ") || 'None'}
+
+**Tone and Rules:**
+1. Be exceptionally friendly, encouraging, and clear.
+2. If the student asks about lessons, refer specifically to their lessons listed in context.
+3. If asked about ranks or XP, mention their actual level/rank and motivate them to complete pending tasks to scale higher.
+4. Keep answers readable. Use bold text and short, scannable bullet points.
+5. Do NOT mention that you are an AI model. Be the tutor.
+6. Use emojis sparingly and warmly.`;
+
+    try {
+      const response = await fetch(api("/api/chat"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          messages: [...aiChat, { role: "user", text: userMessage }].map(m => ({
+            role: m.role,
+            text: m.text
+          })),
+          systemPrompt
+        })
+      });
+
+      const data = await response.json();
+      if (response.ok) {
+        setAiChat(prev => [...prev, { role: "assistant", text: data.text }]);
+      } else {
+        setAiChat(prev => [...prev, {
+          role: "assistant",
+          text: `⚠️ **${t.errorLabel}**: ${data.error || t.failedContactAssistant}`
+        }]);
+      }
+    } catch (err: any) {
+      setAiChat(prev => [...prev, {
+        role: "assistant",
+        text: `⚠️ **${t.connectionError}**: ${t.connectionErrorDesc}`
+      }]);
+    } finally {
+      setAiLoading(false);
+    }
+  };
+
+  // Helper variables for filtered arrays
+  const classLessons = lessons.filter(l => l.classId === activeClass?.id);
+  const classTasks = tasks.filter(t => t.classId === activeClass?.id);
+  const classAnnouncements = announcements.filter(a => a.classId === activeClass?.id);
+  const classMessages = chatMessages.filter(m => m.classId === activeClass?.id);
+  const classEvents = events.filter(e => e.classId === activeClass?.id);
+
+  // Leaderboard logic: Sort all students in class by XP
+  const classStudents = allStudents
+    .filter(s => activeClass?.studentIds?.includes(s.id) ?? false)
+    .sort((a, b) => b.xp - a.xp);
+
+  return (
+    <div className="min-h-screen bg-slate-50 dark:bg-[#0b081a] text-slate-800 dark:text-slate-100 flex flex-col transition-colors duration-200">
+      {/* Level-up celebration */}
+      <Confetti trigger={confettiTick} />
+      <LevelUpToast level={levelUpTo} onDone={() => setLevelUpTo(null)} />
+
+      {/* Toast Notification */}
+      <AnimatePresence>
+        {notification && (
+          <motion.div
+            initial={{ opacity: 0, y: -20, scale: 0.95 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: -20, scale: 0.95 }}
+            className="fixed top-24 right-6 z-50 max-w-sm bg-slate-900/95 dark:bg-[#1c1836]/95 backdrop-blur-md border border-slate-700/50 dark:border-indigo-500/30 px-4 py-3.5 rounded-2xl text-white text-xs font-semibold shadow-2xl flex items-center gap-3"
+          >
+            <div className="p-1 bg-emerald-500/15 text-emerald-400 rounded-lg">
+              <CheckCircle2 className="h-4.5 w-4.5" />
+            </div>
+            <span>{notification.message}</span>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Upper Navigation Bar */}
+      <header className="sticky top-0 z-40 bg-white dark:bg-[#130f26] border-b border-slate-200 dark:border-[#241c49]/80 px-3 sm:px-6 py-3 sm:py-4 flex flex-wrap items-center justify-between gap-2 sm:gap-4">
+        <div className="flex items-center gap-2 sm:gap-3">
+          {/* Hamburger on the left (mobile only) */}
+          <button
+            onClick={() => setMenuOpen(true)}
+            aria-label="Open menu"
+            className="md:hidden p-2 -ms-1 text-slate-600 dark:text-slate-300 cursor-pointer"
+          >
+            <Menu className="h-6 w-6" />
+          </button>
+          <div className="p-1.5 sm:p-2 bg-indigo-500 text-white rounded-xl shadow-md">
+            <BookOpen className="h-4 w-4 sm:h-5 sm:w-5" />
+          </div>
+          <div>
+            <h1 className="text-base sm:text-xl font-bold font-display tracking-tight text-slate-900 dark:text-slate-50">insyte</h1>
+            <p className="text-slate-400 text-[9px] sm:text-[10px] uppercase font-mono tracking-widest font-bold hidden xs:block sm:block">{t.studentCenter}</p>
+          </div>
+        </div>
+
+        {/* Class Tabs (Grade Selector visible regardless of active tab) */}
+        {grades.length > 0 && (
+          <div className="flex items-center gap-1.5 bg-slate-100 dark:bg-[#1c1836]/60 p-1.5 rounded-xl border border-slate-200 dark:border-[#2d2553]/50">
+            {grades.map((grade) => {
+              const isActive = activeGrade === grade;
+              return (
+                <button
+                  key={grade}
+                  onClick={() => {
+                    const firstCl = classesByGrade[grade]?.[0];
+                    if (firstCl) {
+                      setActiveClass(firstCl);
+                      setSelectedLesson(null);
+                      setSelectedTask(null);
+                      handleResetDragDrop();
+                    }
+                  }}
+                  className={`px-3.5 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                    isActive
+                      ? "bg-indigo-600 text-white shadow-xs"
+                      : "text-slate-500 dark:text-slate-400 hover:bg-slate-200/50 dark:hover:bg-[#251e44]/50"
+                  }`}
+                >
+                  {grade}
+                </button>
+              );
+            })}
+          </div>
+        )}
+
+        {/* Profile chip — always visible, compact on mobile */}
+        <div className="flex items-center gap-2 sm:gap-4">
+          <button
+            onClick={() => { setActiveTab("settings"); setSelectedLesson(null); setSelectedTask(null); }}
+            title={t.settings}
+            className="flex items-center gap-2 sm:gap-3 bg-slate-50 dark:bg-[#1c1836] border border-slate-200/60 dark:border-[#2d2553]/50 rounded-xl px-2 sm:px-3 py-1.5 cursor-pointer hover:border-indigo-300 dark:hover:border-indigo-500/40 transition-colors"
+          >
+            <img
+              src={currentStudent.avatar}
+              alt={currentStudent.name}
+              className="w-7 h-7 sm:w-8 sm:h-8 rounded-full object-cover bg-slate-200 dark:bg-slate-700 p-0.5"
+            />
+            <div className="text-center hidden sm:block">
+              <div className="text-xs font-bold text-slate-800 dark:text-slate-100">{currentStudent.name}</div>
+              <div className="text-[9px] text-amber-500 font-bold uppercase tracking-wider font-mono">
+                {t.level} {currentStudent.level} • {currentStudent.xp} XP
+              </div>
+            </div>
+          </button>
+
+          {/* Desktop: controls inline */}
+          <div className="hidden md:flex items-center gap-4">
+            <XpBar user={currentStudent} />
+            <StreakBadge streak={currentStudent.streak} label={t.streakLabel} />
+            <NotificationBell
+              notifications={notifications}
+              onMarkAllRead={onMarkNotificationsRead}
+              emptyLabel={t.noNotifications}
+              title={t.notificationsTitle}
+              markReadLabel={t.markAllRead}
+            />
+            <NavbarControls language={language} setLanguage={setLanguage} theme={theme} setTheme={setTheme} />
+          </div>
+
+          {/* Mobile: XP bar + streak in header; logout moved into the drawer */}
+          <div className="flex md:hidden items-center gap-2">
+            <XpBar user={currentStudent} className="w-20" />
+            <StreakBadge streak={currentStudent.streak} label={t.streakLabel} />
+          </div>
+
+          <button
+            onClick={onLogOut}
+            className="hidden md:block p-2.5 bg-white dark:bg-[#1c1836] border border-slate-200 dark:border-[#2d2553]/50 hover:bg-slate-50 dark:hover:bg-[#282154] text-slate-500 dark:text-slate-400 hover:text-red-500 rounded-xl transition-all"
+            title={t.logout}
+          >
+            <LogOut className="h-4.5 w-4.5" />
+          </button>
+        </div>
+      </header>
+
+      {/* Main Workspace Layout */}
+      {activeClass ? (
+        <div className="flex-1 flex flex-col md:flex-row md:h-[calc(100vh-73px)]">
+
+          {/* Dark overlay behind the mobile drawer */}
+          {menuOpen && (
+            <div className="md:hidden fixed inset-0 z-40 bg-slate-900/50 backdrop-blur-sm" onClick={() => setMenuOpen(false)} />
+          )}
+
+          {/* Workspace nav: slide-in drawer on mobile, static rail on desktop.
+              Any click inside closes the drawer on mobile. */}
+          <aside
+            onClick={() => setMenuOpen(false)}
+            className={`mobile-drawer ${menuOpen ? "open" : ""} md:static md:w-64 bg-white dark:bg-[#130f26] md:border-r border-slate-200 dark:border-[#241c49]/80 p-3 md:p-4 flex flex-col gap-1.5 overflow-y-auto shrink-0`}
+          >
+            {/* Mobile-only: bell + language/theme at the top of the drawer */}
+            <div className="md:hidden flex items-center gap-2 pb-3 mb-1 border-b border-slate-200 dark:border-[#241c49]" onClick={(e) => e.stopPropagation()}>
+              <NotificationBell
+                inDrawer
+                notifications={notifications}
+                onMarkAllRead={onMarkNotificationsRead}
+                emptyLabel={t.noNotifications}
+                title={t.notificationsTitle}
+                markReadLabel={t.markAllRead}
+              />
+              <NavbarControls language={language} setLanguage={setLanguage} theme={theme} setTheme={setTheme} />
+            </div>
+            <button
+              onClick={() => { setActiveTab("dashboard"); setSelectedLesson(null); setSelectedTask(null); }}
+              className={`w-auto md:w-full shrink-0 flex items-center justify-start gap-2.5 px-3.5 md:px-4 py-2.5 md:py-3 rounded-xl text-xs font-bold transition-all ${
+                activeTab === "dashboard" 
+                  ? "bg-slate-100 dark:bg-[#1c1836] text-slate-900 dark:text-slate-100 border border-slate-200/80 dark:border-[#2d2553]/50 shadow-xs" 
+                  : "text-slate-500 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-[#1c1836]/40 hover:text-slate-800 dark:hover:text-slate-200 border border-transparent"
+              }`}
+            >
+              <Trophy className="h-4 w-4" />
+              <span>{t.lobby}</span>
+            </button>
+
+            <div>
+              <button
+                onClick={() => { setActiveTab("lessons"); setSelectedLesson(null); setSelectedTask(null); }}
+                className={`w-auto md:w-full shrink-0 flex items-center justify-start gap-2.5 px-3.5 md:px-4 py-2.5 md:py-3 rounded-xl text-xs font-bold transition-all ${
+                  activeTab === "lessons"
+                    ? "bg-slate-100 dark:bg-[#1c1836] text-slate-900 dark:text-slate-100 border border-slate-200/80 dark:border-[#2d2553]/50 shadow-xs"
+                    : "text-slate-500 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-[#1c1836]/40 hover:text-slate-800 dark:hover:text-slate-200 border border-transparent"
+                }`}
+              >
+                <BookOpen className="h-4 w-4" />
+                <span>{t.lessons}</span>
+                {activeGradeClasses.length > 0 && (
+                  <ChevronRight className={`h-3.5 w-3.5 ml-auto transition-transform ${activeTab === "lessons" ? "rotate-90" : ""}`} />
+                )}
+              </button>
+              {activeTab === "lessons" && activeGradeClasses.length > 0 && (
+                <div className="mt-1 ms-4 ps-3 border-s border-slate-200 dark:border-[#2d2553]/60 flex flex-col gap-1">
+                  {activeGradeClasses.map((cl) => {
+                    const { subject } = getGradeAndSubject(cl.name);
+                    const isSelected = activeClass?.id === cl.id;
+                    const clColors = getClassColors(cl.color);
+                    return (
+                      <button
+                        key={cl.id}
+                        onClick={() => { setActiveClass(cl); setSelectedLesson(null); setSelectedTask(null); handleResetDragDrop(); }}
+                        className={`w-full flex items-center gap-2 px-3 py-2 rounded-lg text-[11px] font-semibold transition-all cursor-pointer ${
+                          isSelected
+                            ? `bg-white dark:bg-[#1c1836] ${clColors.text} shadow-xs border ${clColors.border}`
+                            : `text-slate-500 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-[#1c1836]/40 border border-transparent`
+                        }`}
+                      >
+                        <span className={`w-1.5 h-1.5 rounded-full ${clColors.bgSolid} ${isSelected ? "animate-pulse" : "opacity-60"}`} />
+                        {subject}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            <div>
+              <button
+                onClick={() => { setActiveTab("tasks"); setSelectedLesson(null); setSelectedTask(null); }}
+                className={`w-auto md:w-full shrink-0 flex items-center justify-start gap-2.5 px-3.5 md:px-4 py-2.5 md:py-3 rounded-xl text-xs font-bold transition-all ${
+                  activeTab === "tasks"
+                    ? "bg-slate-100 dark:bg-[#1c1836] text-slate-900 dark:text-slate-100 border border-slate-200/80 dark:border-[#2d2553]/50 shadow-xs"
+                    : "text-slate-500 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-[#1c1836]/40 hover:text-slate-800 dark:hover:text-slate-200 border border-transparent"
+                }`}
+              >
+                <Award className="h-4 w-4" />
+                <span>{t.assignments}</span>
+                {activeGradeClasses.length > 0 && (
+                  <ChevronRight className={`h-3.5 w-3.5 ml-auto transition-transform ${activeTab === "tasks" ? "rotate-90" : ""}`} />
+                )}
+              </button>
+              {activeTab === "tasks" && activeGradeClasses.length > 0 && (
+                <div className="mt-1 ms-4 ps-3 border-s border-slate-200 dark:border-[#2d2553]/60 flex flex-col gap-1">
+                  {activeGradeClasses.map((cl) => {
+                    const { subject } = getGradeAndSubject(cl.name);
+                    const isSelected = activeClass?.id === cl.id;
+                    const clColors = getClassColors(cl.color);
+                    return (
+                      <button
+                        key={cl.id}
+                        onClick={() => { setActiveClass(cl); setSelectedLesson(null); setSelectedTask(null); handleResetDragDrop(); }}
+                        className={`w-full flex items-center gap-2 px-3 py-2 rounded-lg text-[11px] font-semibold transition-all cursor-pointer ${
+                          isSelected
+                            ? `bg-white dark:bg-[#1c1836] ${clColors.text} shadow-xs border ${clColors.border}`
+                            : `text-slate-500 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-[#1c1836]/40 border border-transparent`
+                        }`}
+                      >
+                        <span className={`w-1.5 h-1.5 rounded-full ${clColors.bgSolid} ${isSelected ? "animate-pulse" : "opacity-60"}`} />
+                        {subject}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            <button
+              onClick={() => { setActiveTab("chat"); setSelectedLesson(null); setSelectedTask(null); }}
+              className={`w-auto md:w-full shrink-0 flex items-center justify-start gap-2.5 px-3.5 md:px-4 py-2.5 md:py-3 rounded-xl text-xs font-bold transition-all ${
+                activeTab === "chat" 
+                  ? "bg-slate-100 dark:bg-[#1c1836] text-slate-900 dark:text-slate-100 border border-slate-200/80 dark:border-[#2d2553]/50 shadow-xs" 
+                  : "text-slate-500 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-[#1c1836]/40 hover:text-slate-800 dark:hover:text-slate-200 border border-transparent"
+              }`}
+            >
+              <MessageSquare className="h-4 w-4" />
+              <span>{t.peerDiscuss}</span>
+            </button>
+
+            <button
+              onClick={() => { setActiveTab("ai"); setSelectedLesson(null); setSelectedTask(null); }}
+              className={`w-auto md:w-full shrink-0 flex items-center justify-start gap-2.5 px-3.5 md:px-4 py-2.5 md:py-3 rounded-xl text-xs font-bold transition-all relative ${
+                activeTab === "ai" 
+                  ? "bg-slate-100 dark:bg-[#1c1836] text-slate-900 dark:text-slate-100 border border-slate-200/80 dark:border-[#2d2553]/50 shadow-xs" 
+                  : "text-slate-500 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-[#1c1836]/40 hover:text-slate-800 dark:hover:text-slate-200 border border-transparent"
+              }`}
+            >
+              <Sparkles className="h-4 w-4" />
+              <span>{t.aiTutor}</span>
+              <span className={`absolute top-1 right-2 w-2 h-2 rounded-full bg-indigo-500 animate-ping`} />
+            </button>
+
+            <button
+              onClick={() => { setActiveTab("calendar"); setSelectedLesson(null); setSelectedTask(null); }}
+              className={`w-auto md:w-full shrink-0 flex items-center justify-start gap-2.5 px-3.5 md:px-4 py-2.5 md:py-3 rounded-xl text-xs font-bold transition-all ${
+                activeTab === "calendar" 
+                  ? "bg-slate-100 dark:bg-[#1c1836] text-slate-900 dark:text-slate-100 border border-slate-200/80 dark:border-[#2d2553]/50 shadow-xs" 
+                  : "text-slate-500 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-[#1c1836]/40 hover:text-slate-800 dark:hover:text-slate-200 border border-transparent"
+              }`}
+            >
+              <Calendar className="h-4 w-4" />
+              <span>{t.calendar}</span>
+            </button>
+
+            <button
+              onClick={() => { setActiveTab("mail"); setSelectedLesson(null); setSelectedTask(null); }}
+              className={`w-auto md:w-full shrink-0 flex items-center justify-start gap-2.5 px-3.5 md:px-4 py-2.5 md:py-3 rounded-xl text-xs font-bold transition-all ${
+                activeTab === "mail"
+                  ? "bg-slate-100 dark:bg-[#1c1836] text-slate-900 dark:text-slate-100 border border-slate-200/80 dark:border-[#2d2553]/50 shadow-xs"
+                  : "text-slate-500 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-[#1c1836]/40 hover:text-slate-800 dark:hover:text-slate-200 border border-transparent"
+              }`}
+            >
+              <MailLucide className="h-4 w-4" />
+              <span>{t.mailTab}</span>
+              {unreadMailCount > 0 && (
+                <span className="ml-auto min-w-4.5 h-4.5 px-1 bg-red-500 text-white text-[9px] font-bold rounded-full flex items-center justify-center">
+                  {unreadMailCount}
+                </span>
+              )}
+            </button>
+
+            <button
+              onClick={() => setJoinOpen(true)}
+              className="w-auto md:w-full shrink-0 flex items-center justify-start gap-2.5 px-3.5 md:px-4 py-2.5 md:py-3 rounded-xl text-xs font-bold transition-all text-indigo-600 dark:text-indigo-400 bg-indigo-50 dark:bg-indigo-950/30 hover:bg-indigo-100 dark:hover:bg-indigo-950/50 border border-indigo-200/60 dark:border-indigo-500/20 cursor-pointer"
+            >
+              <UserPlus className="h-4 w-4" />
+              <span>{t.joinCommunity}</span>
+            </button>
+
+            <button
+              onClick={() => { setActiveTab("settings"); setSelectedLesson(null); setSelectedTask(null); }}
+              className={`w-auto md:w-full shrink-0 flex items-center justify-start gap-2.5 px-3.5 md:px-4 py-2.5 md:py-3 rounded-xl text-xs font-bold transition-all ${
+                activeTab === "settings" 
+                  ? "bg-slate-100 dark:bg-[#1c1836] text-slate-900 dark:text-slate-100 border border-slate-200/80 dark:border-[#2d2553]/50 shadow-xs" 
+                  : "text-slate-500 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-[#1c1836]/40 hover:text-slate-800 dark:hover:text-slate-200 border border-transparent"
+              }`}
+            >
+              <Settings className="h-4 w-4" />
+              <span>{t.settings}</span>
+            </button>
+
+            {/* Logout at the bottom of the mobile drawer */}
+            <button
+              onClick={onLogOut}
+              className="md:hidden mt-auto w-full flex items-center justify-start gap-2.5 px-3.5 py-3 rounded-xl text-xs font-bold text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-950/30 border border-red-100 dark:border-red-900/40 cursor-pointer"
+            >
+              <LogOut className="h-4 w-4" />
+              <span>{t.logout}</span>
+            </button>
+          </aside>
+
+          {/* Active View Panel */}
+          <main className="flex-1 bg-slate-50/50 dark:bg-slate-900/50 p-4 sm:p-6 overflow-y-auto">
+
+            
+            {/* LOBBY TAB */}
+            {activeTab === "dashboard" && (
+              <div className="space-y-6">
+
+                {/* Daily check-in / streak card */}
+                <div className="p-4 bg-gradient-to-br from-orange-50 to-amber-50 dark:from-orange-950/20 dark:to-amber-950/10 border border-orange-200/70 dark:border-orange-500/20 rounded-2xl flex items-center gap-4">
+                  <div className="text-3xl">🔥</div>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm font-bold text-slate-800 dark:text-slate-100">
+                      {currentStudent.streak}-{t.dayStreak}
+                    </div>
+                    <div className="text-[11px] text-slate-500 dark:text-slate-400">
+                      {currentStudent.lastActiveDate === new Date().toISOString().slice(0, 10)
+                        ? t.checkedInToday
+                        : t.checkInPrompt}
+                    </div>
+                  </div>
+                  {currentStudent.lastActiveDate === new Date().toISOString().slice(0, 10) && (
+                    <span className="flex items-center gap-1 text-[11px] font-bold text-emerald-600 dark:text-emerald-400 shrink-0">
+                      <CheckCircle2 className="h-4 w-4" /> {t.done}
+                    </span>
+                  )}
+                </div>
+
+                {/* Classroom Headline Banner */}
+                <div className="p-6 bg-radial from-slate-900 to-slate-950 text-white rounded-3xl border border-slate-800 shadow-xl relative overflow-hidden">
+                  <div className="absolute top-[-30%] right-[-10%] w-60 h-60 bg-indigo-500/10 rounded-full blur-[80px]" />
+                  <div className="relative z-10 flex flex-col md:flex-row md:items-center justify-between gap-6">
+                    <div>
+                      <span className="text-[10px] font-bold text-indigo-400 uppercase tracking-widest font-mono">{t.enrolledClassroom}</span>
+                      <h2 className="text-2xl font-extrabold font-display mt-1">{activeClass.name}</h2>
+                      <p className="text-slate-400 text-xs mt-2 max-w-xl leading-relaxed">{activeClass.description}</p>
+                      <button
+                        onClick={() => setLeaveConfirm(activeClass)}
+                        className="mt-4 inline-flex items-center gap-1.5 text-[11px] font-bold text-red-300 hover:text-red-200 bg-red-500/10 hover:bg-red-500/20 border border-red-500/30 px-3 py-1.5 rounded-lg transition-all cursor-pointer"
+                      >
+                        <LogOut className="h-3.5 w-3.5" />
+                        {t.leaveClass}
+                      </button>
+                    </div>
+
+                    {/* XP Progress Circular Metric */}
+                    <div className="flex items-center gap-4 bg-slate-800/50 border border-slate-700/50 p-4 rounded-2xl w-fit">
+                      <div className="relative w-12 h-12 flex items-center justify-center">
+                        <svg className="w-full h-full transform -rotate-90">
+                          <circle cx="24" cy="24" r="20" fill="transparent" stroke="#334155" strokeWidth="4" />
+                          <circle 
+                            cx="24" 
+                            cy="24" 
+                            r="20" 
+                            fill="transparent" 
+                            stroke="#6366F1" 
+                            strokeWidth="4" 
+                            strokeDasharray="125.6"
+                            strokeDashoffset={125.6 - (125.6 * (currentStudent.xp % 1000)) / 1000}
+                            strokeLinecap="round"
+                          />
+                        </svg>
+                        <div className="absolute font-mono font-bold text-xs text-indigo-400">
+                          {t.lvlPrefix}{currentStudent.level}
+                        </div>
+                      </div>
+                      <div>
+                        <div className="text-xs font-bold text-slate-200">{t.yourStanding}</div>
+                        <div className="text-[11px] text-amber-400 font-semibold mt-0.5">{currentStudent.xp} {t.totalXpLabel}</div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Dashboard Grid Sections */}
+                <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                  
+                  {/* Left Column: Alerts & Schedules */}
+                  <div className="lg:col-span-2 space-y-6">
+                    
+                    {/* Notice Board */}
+                    <div className="bg-white dark:bg-[#18142c] border border-slate-200 dark:border-[#2b244c] rounded-2xl p-5 shadow-xs">
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4">
+                        <h3 className="text-sm font-bold font-display text-slate-800 dark:text-indigo-100 flex items-center gap-2">
+                          <Bell className="h-4.5 w-4.5 text-indigo-500" /> {t.profsAnnouncements}
+                        </h3>
+                        
+                        {/* Announcement Search Bar */}
+                        <div className="relative w-full sm:w-64">
+                          <Search className="absolute left-2.5 top-2 h-3.5 w-3.5 text-slate-400" />
+                          <input
+                            type="text"
+                            placeholder={t.searchAnnouncements}
+                            value={announcementSearch}
+                            onChange={(e) => setAnnouncementSearch(e.target.value)}
+                            className="w-full pl-8 pr-7 py-1.5 bg-slate-50 dark:bg-[#1c1836] border border-slate-100 dark:border-[#2b244c] focus:border-indigo-500 rounded-lg text-xs text-slate-700 dark:text-slate-200 focus:outline-hidden"
+                          />
+                          {announcementSearch && (
+                            <button 
+                              onClick={() => setAnnouncementSearch("")}
+                              className="absolute right-2.5 top-2 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 text-xs font-semibold cursor-pointer"
+                            >
+                              ✕
+                            </button>
+                          )}
+                        </div>
+                      </div>
+
+                      {(() => {
+                        const filteredAnnouncements = classAnnouncements.filter(ann => 
+                          ann.title.toLowerCase().includes(announcementSearch.toLowerCase()) || 
+                          ann.content.toLowerCase().includes(announcementSearch.toLowerCase())
+                        );
+
+                        return filteredAnnouncements.length > 0 ? (
+                          <div className="space-y-4">
+                            {filteredAnnouncements.map((ann) => (
+                              <div key={ann.id} className="p-4 bg-slate-50 dark:bg-[#201b3a] border border-slate-100 dark:border-[#2d2553]/50 rounded-xl relative">
+                                <h4 className="font-bold text-xs text-slate-800 dark:text-slate-100 flex items-center gap-1.5">
+                                  {ann.title}
+                                </h4>
+                                <p className="text-slate-600 dark:text-slate-300 text-xs mt-1.5 leading-relaxed">{ann.content}</p>
+                                <div className="text-[9px] text-slate-400 dark:text-slate-500 font-mono mt-3 text-right">
+                                  {t.postedBy} {ann.authorName} • {new Date(ann.publishedAt).toLocaleDateString()}
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <p className="text-slate-400 text-xs text-center py-4">
+                            {announcementSearch ? t.noAnnouncementsMatch : t.noRecentAnnouncements}
+                          </p>
+                        );
+                      })()}
+                    </div>
+
+                    {/* Class Schedule Calendar */}
+                    <div className="bg-white dark:bg-[#18142c] border border-slate-200 dark:border-[#2b244c] rounded-2xl p-5 shadow-xs">
+                      <h3 className="text-sm font-bold font-display text-slate-800 dark:text-indigo-100 flex items-center gap-2 mb-4">
+                        <Calendar className="h-4.5 w-4.5 text-indigo-500" /> {t.classroomCalendar}
+                      </h3>
+                      {classEvents.length > 0 ? (
+                        <div className="space-y-3">
+                          {classEvents.map((evt) => (
+                            <div key={evt.id} className="flex items-center justify-between p-3.5 bg-slate-50 dark:bg-[#201b3a] hover:bg-slate-100/50 dark:hover:bg-[#282154] rounded-xl transition-all border border-slate-100 dark:border-[#2d2553]/50">
+                              <div className="flex items-center gap-3">
+                                <div className="p-2 bg-indigo-50 dark:bg-indigo-950/40 text-indigo-600 dark:text-indigo-300 rounded-lg">
+                                  <Clock className="h-4 w-4" />
+                                </div>
+                                <div className="text-left">
+                                  <h4 className="font-bold text-xs text-slate-800 dark:text-slate-100">{evt.title}</h4>
+                                  <p className="text-slate-500 dark:text-slate-400 text-[10px] mt-0.5">{evt.description}</p>
+                                </div>
+                              </div>
+                              <div className="text-right text-[10px] font-mono text-indigo-600 dark:text-indigo-300 font-semibold bg-indigo-50 dark:bg-indigo-950/40 px-2 py-1 rounded-md">
+                                {evt.date} • {evt.time}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <p className="text-slate-400 text-xs text-center py-4">{t.noEvents}</p>
+                      )}
+                    </div>
+
+                  </div>
+
+                  {/* Right Column: Class Leaderboard */}
+                  <div className="space-y-6">
+                    <div className="bg-white dark:bg-[#18142c] border border-slate-200 dark:border-[#2b244c] rounded-2xl p-5 shadow-xs">
+                      <h3 className="text-sm font-bold font-display text-slate-800 dark:text-indigo-100 flex items-center gap-2 mb-4">
+                        <Trophy className="h-4.5 w-4.5 text-amber-500" /> {t.leaderboard}
+                      </h3>
+
+                      <div className="space-y-2.5">
+                        {classStudents.map((stud, idx) => {
+                          const isSelf = stud.id === currentStudent.id;
+                          return (
+                            <div 
+                              key={stud.id}
+                              className={`flex items-center justify-between p-3 rounded-xl border transition-all ${
+                                isSelf 
+                                  ? "bg-indigo-50/50 dark:bg-[#1c1836] border-indigo-200 dark:border-indigo-800/40 shadow-xs" 
+                                  : "bg-slate-50/50 dark:bg-[#201b3a] border-slate-100 dark:border-[#2d2553]/50 hover:bg-slate-50 dark:hover:bg-[#282154]"
+                              }`}
+                            >
+                              <div className="flex items-center gap-3">
+                                {/* Rank Numbers styled */}
+                                <div className="w-6 text-center font-mono font-black text-xs text-slate-400">
+                                  {idx === 0 ? "🥇" : idx === 1 ? "🥈" : idx === 2 ? "🥉" : `${idx + 1}`}
+                                </div>
+                                <img
+                                  src={stud.avatar}
+                                  alt={stud.name}
+                                  className="w-8 h-8 rounded-full bg-white dark:bg-slate-700 p-0.5 border border-slate-200 dark:border-slate-600"
+                                />
+                                <div className="text-left">
+                                  <div className={`text-xs font-bold ${isSelf ? "text-indigo-600 dark:text-indigo-400" : "text-slate-800 dark:text-slate-200"}`}>
+                                    {stud.name} {isSelf && t.youLabel}
+                                  </div>
+                                  <div className="text-[9px] text-slate-400 dark:text-slate-500 uppercase tracking-wide font-mono mt-0.5">
+                                    {stud.rank}
+                                  </div>
+                                </div>
+                              </div>
+
+                              <div className="text-right font-mono text-xs font-bold text-slate-700 dark:text-[#ece9f6] bg-white dark:bg-[#1c1836] border border-slate-200/50 dark:border-[#2d2553]/50 px-2.5 py-1 rounded-lg">
+                                {stud.xp} XP
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  </div>
+
+                </div>
+
+              </div>
+            )}
+
+            {/* LESSONS READER TAB */}
+            {activeTab === "lessons" && (() => {
+              const filteredLessons = classLessons.filter(l => 
+                l.title.toLowerCase().includes(lessonSearch.toLowerCase()) || 
+                l.content.toLowerCase().includes(lessonSearch.toLowerCase())
+              );
+              return (
+                <div>
+                  {!selectedLesson ? (
+                    <div className="space-y-4">
+                      <div className="flex flex-col md:flex-row gap-4 items-stretch md:items-center justify-between">
+                        <div>
+                          <h2 className="text-lg font-bold font-display text-slate-800 dark:text-indigo-100 mb-0.5">{t.lessonsReadingGuides}</h2>
+                          <p className="text-slate-400 text-xs">{t.lessonsSubtitle}</p>
+                        </div>
+                        <span className="bg-indigo-500/10 text-indigo-500 border border-indigo-500/20 px-3 py-1 rounded-full text-xs font-mono font-semibold self-start md:self-center">
+                          {filteredLessons.length} {t.available}
+                        </span>
+                      </div>
+
+                      {/* Lesson Search Bar */}
+                      <div className="relative">
+                        <Search className="absolute left-3 top-2.5 h-4 w-4 text-slate-400" />
+                        <input
+                          type="text"
+                          placeholder={t.searchLessonsPlaceholder}
+                          value={lessonSearch}
+                          onChange={(e) => setLessonSearch(e.target.value)}
+                          className="w-full pl-9 pr-4 py-2 bg-white dark:bg-[#18142c] border border-slate-200 dark:border-[#2b244c] focus:border-indigo-500 rounded-xl text-xs text-slate-700 dark:text-slate-200 focus:outline-hidden"
+                        />
+                        {lessonSearch && (
+                          <button 
+                            onClick={() => setLessonSearch("")}
+                            className="absolute right-3 top-2.5 text-xs text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 cursor-pointer"
+                          >
+                            {t.clear}
+                          </button>
+                        )}
+                      </div>
+
+                      {filteredLessons.length === 0 ? (
+                        <div className="py-12 text-center bg-white dark:bg-[#18142c] border border-slate-200 dark:border-[#2b244c] rounded-2xl">
+                          <BookOpen className="h-8 w-8 text-slate-300 dark:text-slate-600 mx-auto mb-2" />
+                          <p className="text-xs text-slate-400 font-semibold">{t.noLessonsMatch}</p>
+                        </div>
+                      ) : (
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                          {filteredLessons.map((les) => (
+                        <div 
+                          key={les.id}
+                          className="bg-white dark:bg-[#18142c] border border-slate-200 dark:border-[#2b244c] p-5 rounded-2xl hover:border-indigo-400/60 shadow-xs cursor-pointer transition-all flex flex-col justify-between group"
+                          onClick={() => setSelectedLesson(les)}
+                        >
+                          <div>
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="bg-indigo-50 dark:bg-indigo-950/40 text-indigo-600 dark:text-indigo-300 px-2.5 py-1 rounded-md text-[9px] font-mono font-bold uppercase tracking-wide">
+                                {t.moduleReading}
+                              </span>
+                              <div className="flex gap-1.5">
+                                {les.videoUrl && (
+                                  <span className="p-1 bg-red-50 dark:bg-red-950/30 text-red-600 dark:text-red-400 rounded" title={t.includesVideoLecture}>
+                                    <Video className="h-3 w-3" />
+                                  </span>
+                                )}
+                                {les.pptUrl && (
+                                  <span className="p-1 bg-amber-50 dark:bg-amber-950/30 text-amber-600 dark:text-amber-400 rounded" title={t.includesLectureSlides}>
+                                    <Presentation className="h-3 w-3" />
+                                  </span>
+                                )}
+                                {les.webUrl && (
+                                  <span className="p-1 bg-blue-50 dark:bg-blue-950/30 text-blue-600 dark:text-blue-400 rounded" title={t.includesExternalWebsite}>
+                                    <Globe className="h-3 w-3" />
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                            <h3 className="font-bold text-slate-800 dark:text-slate-100 text-sm mt-3 group-hover:text-indigo-500 transition-colors">{les.title}</h3>
+                            <p className="text-slate-400 dark:text-slate-400 text-xs mt-1.5 leading-relaxed line-clamp-3">
+                              {les.content.replace(/[#*`_-]/g, '')}
+                            </p>
+                          </div>
+                          <div className="mt-4 pt-3 border-t border-slate-100 dark:border-[#251e40] flex items-center justify-between text-[11px] font-bold text-indigo-600 dark:text-indigo-400">
+                            <span>{t.openLessonGuide}</span>
+                            <ChevronRight className="h-4 w-4 transform group-hover:translate-x-1 transition-transform" />
+                          </div>
+                        </div>
+                      ))}
+                        </div>
+                      )}
+                    </div>
+                ) : (
+                  <motion.div 
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    className="bg-white dark:bg-[#18142c] border border-slate-200 dark:border-[#2b244c] rounded-3xl p-6 md:p-8 shadow-sm space-y-6"
+                  >
+                    <button
+                      onClick={() => setSelectedLesson(null)}
+                      className="flex items-center gap-1.5 text-xs text-slate-500 dark:text-slate-400 hover:text-slate-800 dark:hover:text-slate-200 transition-colors font-semibold"
+                    >
+                      <ArrowLeft className="h-4 w-4" /> {t.backToLessons}
+                    </button>
+
+                    <div>
+                      <h2 className="text-2xl font-bold font-display text-slate-800 dark:text-slate-100 pb-2">
+                        {selectedLesson.title}
+                      </h2>
+                      <span className="text-[10px] text-slate-400 font-semibold font-mono">
+                        {t.publishedCaps} {new Date(selectedLesson.publishedAt).toLocaleDateString()} {t.byCaps} {activeClass?.teacherName || t.classInstructor}
+                      </span>
+                    </div>
+
+                    <div className="prose max-w-none text-slate-700 dark:text-slate-300 text-sm leading-relaxed space-y-4 whitespace-pre-wrap border-t border-slate-100 dark:border-[#251e40] pt-4">
+                      {selectedLesson.content}
+                    </div>
+
+                    {/* DETAILED INTERACTIVE MEDIA SECTION */}
+                    {(selectedLesson.videoUrl || selectedLesson.pptUrl || selectedLesson.webUrl) && (
+                      <div className="border-t border-slate-200/50 dark:border-[#2c2452]/40 pt-6 space-y-4">
+                        <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider">
+                          {t.interactiveLessonMedia}
+                        </h3>
+                        
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                          {/* VIDEO PLAYER */}
+                          {selectedLesson.videoUrl && (
+                            <div className="bg-slate-50 dark:bg-[#110d26] border border-slate-200 dark:border-[#2b244c] rounded-2xl p-4 shadow-inner flex flex-col justify-between">
+                              <div>
+                                <span className="flex items-center gap-1.5 text-[10px] font-bold text-red-600 dark:text-red-400 uppercase tracking-wider mb-2">
+                                  <Video className="h-3.5 w-3.5 animate-pulse" /> {t.videoLectureDemo}
+                                </span>
+                                <div className="relative aspect-video rounded-xl overflow-hidden border border-slate-200 dark:border-[#2b244c]">
+                                  <iframe
+                                    src={getYoutubeEmbedUrl(selectedLesson.videoUrl)}
+                                    title={t.videoLecture}
+                                    className="absolute inset-0 w-full h-full"
+                                    allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+                                    allowFullScreen
+                                  />
+                                </div>
+                              </div>
+                            </div>
+                          )}
+
+                          {/* POWERPOINT / SLIDES SLIDESHOW */}
+                          {selectedLesson.pptUrl && (
+                            <div className="bg-slate-50 dark:bg-[#110d26] border border-slate-200 dark:border-[#2b244c] rounded-2xl p-4 shadow-inner flex flex-col justify-between">
+                              <div>
+                                <span className="flex items-center gap-1.5 text-[10px] font-bold text-amber-600 dark:text-amber-400 uppercase tracking-wider mb-2">
+                                  <Presentation className="h-3.5 w-3.5" /> {t.embeddedPowerpointSlides}
+                                </span>
+                                <div className="relative aspect-video rounded-xl overflow-hidden border border-slate-200 dark:border-[#2b244c] bg-[#1c1836]">
+                                  <iframe
+                                    src={selectedLesson.pptUrl}
+                                    title={t.lessonSlidesPresentation}
+                                    className="absolute inset-0 w-full h-full"
+                                    allowFullScreen
+                                  />
+                                </div>
+                              </div>
+                              <p className="text-[9px] text-slate-400 mt-2 font-mono text-center">{t.useSlideControls}</p>
+                            </div>
+                          )}
+
+                          {/* CORE WEBSITE RESOURCE */}
+                          {selectedLesson.webUrl && (
+                            <div className="bg-slate-50 dark:bg-[#110d26] border border-slate-200 dark:border-[#2b244c] rounded-2xl p-4 shadow-inner col-span-1 md:col-span-2">
+                              <span className="flex items-center gap-1.5 text-[10px] font-bold text-blue-600 dark:text-blue-400 uppercase tracking-wider mb-2">
+                                <Globe className="h-3.5 w-3.5" /> {t.lessonSandboxWebResource}
+                              </span>
+                              
+                              <div className="flex flex-col sm:flex-row items-center gap-4 p-4 bg-white dark:bg-[#1c1836] rounded-xl border border-slate-200 dark:border-[#2b244c]">
+                                <div className="p-3 bg-blue-50 dark:bg-blue-950/40 rounded-xl text-blue-600 dark:text-blue-400">
+                                  <Globe className="h-6 w-6" />
+                                </div>
+                                <div className="flex-1 text-center sm:text-left min-w-0">
+                                  <h4 className="font-bold text-xs text-slate-800 dark:text-slate-100">
+                                    {selectedLesson.webUrlTitle || t.interactiveStudyLab}
+                                  </h4>
+                                  <p className="text-[10px] text-slate-400 dark:text-slate-450 font-semibold truncate mt-0.5">
+                                    {selectedLesson.webUrl}
+                                  </p>
+                                </div>
+                                <a
+                                  href={selectedLesson.webUrl}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  className="w-full sm:w-auto px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white font-bold text-xs rounded-xl flex items-center justify-center gap-1.5 transition-all cursor-pointer shrink-0"
+                                >
+                                  {t.launchInteractiveSandbox} <ExternalLink className="h-3.5 w-3.5" />
+                                </a>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    )}
+
+                    <div className="mt-8 pt-6 border-t border-slate-100 dark:border-[#251e40] flex justify-between items-center bg-slate-50 dark:bg-[#201b3a] -mx-6 -mb-6 p-6 rounded-b-3xl">
+                      <span className="text-xs text-slate-400">
+                        {t.publishedBy} {activeClass?.teacherName || t.classInstructor}
+                      </span>
+                      <button
+                        onClick={() => {
+                          onAddXp(25);
+                          showNotification(t.markReadNotify);
+                          setSelectedLesson(null);
+                        }}
+                        className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs rounded-xl shadow-md shadow-indigo-100 flex items-center gap-1.5 transition-all"
+                      >
+                        <CheckCircle2 className="h-4 w-4" /> {t.markAsRead} (+25 XP)
+                      </button>
+                    </div>
+                  </motion.div>
+                )}
+              </div>
+              );
+            })()}
+
+            {/* ASSIGNMENTS TAB */}
+            {activeTab === "tasks" && (() => {
+              const filteredTasks = classTasks.filter(t => 
+                t.title.toLowerCase().includes(taskSearch.toLowerCase()) || 
+                t.description.toLowerCase().includes(taskSearch.toLowerCase())
+              );
+              return (
+                <div>
+                  {!selectedTask ? (
+                    <div className="space-y-4">
+                      <div className="flex flex-col md:flex-row gap-4 items-stretch md:items-center justify-between">
+                        <h2 className="text-lg font-bold font-display text-slate-800 dark:text-indigo-100 mb-2">{t.pendingAssignments}</h2>
+                        <span className="bg-indigo-500/10 text-indigo-500 border border-indigo-500/20 px-3 py-1 rounded-full text-xs font-mono font-semibold self-start md:self-center">
+                          {filteredTasks.length} {t.available}
+                        </span>
+                      </div>
+
+                      {/* Assignment Search Bar */}
+                      <div className="relative">
+                        <Search className="absolute left-3 top-2.5 h-4 w-4 text-slate-400" />
+                        <input
+                          type="text"
+                          placeholder={t.searchAssignmentsPlaceholder}
+                          value={taskSearch}
+                          onChange={(e) => setTaskSearch(e.target.value)}
+                          className="w-full pl-9 pr-4 py-2 bg-white dark:bg-[#18142c] border border-slate-200 dark:border-[#2b244c] focus:border-indigo-500 rounded-xl text-xs text-slate-700 dark:text-slate-200 focus:outline-hidden"
+                        />
+                        {taskSearch && (
+                          <button 
+                            onClick={() => setTaskSearch("")}
+                            className="absolute right-3 top-2.5 text-xs text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 cursor-pointer"
+                          >
+                            {t.clear}
+                          </button>
+                        )}
+                      </div>
+
+                      {filteredTasks.length === 0 ? (
+                        <div className="py-12 text-center bg-white dark:bg-[#18142c] border border-slate-200 dark:border-[#2b244c] rounded-2xl">
+                          <Award className="h-8 w-8 text-slate-300 dark:text-slate-600 mx-auto mb-2" />
+                          <p className="text-xs text-slate-400 font-semibold">{t.noAssignmentsMatch}</p>
+                        </div>
+                      ) : (
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                          {filteredTasks.map((task) => {
+                        // Check if already completed
+                        const submission = submissions.find(s => s.taskId === task.id && s.studentId === currentStudent.id);
+                        
+                        return (
+                          <div 
+                            key={task.id}
+                            className={`p-5 rounded-2xl border transition-all ${
+                              submission 
+                                ? "bg-emerald-50/40 border-emerald-100 hover:border-emerald-200" 
+                                : "bg-white dark:bg-[#18142c] border-slate-200 dark:border-[#2b244c] hover:border-indigo-400 dark:hover:border-indigo-500"
+                            }`}
+                          >
+                            <div className="flex items-start justify-between">
+                              <span className={`px-2 py-0.5 rounded-md text-[9px] font-mono font-bold uppercase ${
+                                task.type === 'dragdrop' ? "bg-violet-50 dark:bg-violet-950/40 text-violet-600 dark:text-violet-300" : "bg-indigo-50 dark:bg-indigo-950/40 text-indigo-600 dark:text-indigo-300"
+                              }`}>
+                                {task.type === 'dragdrop' ? t.matchingGame : t.writtenEssay}
+                              </span>
+                              <span className="text-amber-500 font-bold text-xs font-mono flex items-center gap-0.5">
+                                <Star className="h-3.5 w-3.5 fill-amber-400 text-amber-500" /> +{task.rewardXp} XP
+                              </span>
+                            </div>
+
+                            <h3 className="font-bold text-slate-800 dark:text-slate-100 text-sm mt-3">{task.title}</h3>
+                            <p className="text-slate-400 dark:text-slate-400 text-xs mt-1.5 leading-relaxed line-clamp-2">{task.description}</p>
+                            
+                            <div className="mt-4 pt-3 border-t border-slate-100 dark:border-[#251e40] flex items-center justify-between text-xs">
+                              <span className="text-slate-400 dark:text-slate-500 font-mono font-semibold">
+                                {t.due}: {task.dueDate}
+                              </span>
+                              
+                              {submission ? (
+                                <div className="text-emerald-600 dark:text-emerald-400 font-semibold flex items-center gap-1 bg-emerald-50 dark:bg-emerald-950/20 px-2.5 py-1 rounded-lg border border-emerald-100 dark:border-emerald-900/30">
+                                  <CheckCircle2 className="h-3.5 w-3.5" /> {t.handedIn}
+                                </div>
+                              ) : (
+                                <button
+                                  onClick={() => setSelectedTask(task)}
+                                  className="text-indigo-600 dark:text-indigo-400 font-bold hover:underline"
+                                >
+                                  {t.completeHomework} →
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })}
+                        </div>
+                      )}
+                    </div>
+                ) : (
+                  <motion.div
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    className="bg-white dark:bg-[#18142c] border border-slate-200 dark:border-[#2b244c] rounded-3xl p-6 md:p-8 shadow-sm"
+                  >
+                    <button
+                      onClick={() => { setSelectedTask(null); handleResetDragDrop(); }}
+                      className="flex items-center gap-1.5 text-xs text-slate-500 dark:text-slate-400 hover:text-slate-800 dark:hover:text-slate-200 transition-colors mb-6 font-semibold"
+                    >
+                      <ArrowLeft className="h-4 w-4" /> {t.backToHomework}
+                    </button>
+
+                    <div className="flex flex-wrap items-center justify-between gap-4 border-b border-slate-100 dark:border-[#251e40] pb-4 mb-6">
+                      <div>
+                        <span className="bg-indigo-50 dark:bg-indigo-950/40 text-indigo-600 dark:text-indigo-400 px-2.5 py-1 rounded-md text-[9px] font-mono font-bold uppercase">
+                          {t.activeAssignment}
+                        </span>
+                        <h2 className="text-xl font-bold font-display text-slate-800 dark:text-slate-100 mt-2">{selectedTask.title}</h2>
+                      </div>
+                      <div className="bg-amber-50 dark:bg-amber-950/20 border border-amber-200 dark:border-amber-900/40 text-amber-600 dark:text-amber-400 font-mono font-bold text-xs px-3 py-1.5 rounded-xl flex items-center gap-1">
+                        <Star className="h-3.5 w-3.5 fill-amber-400 text-amber-500" /> {t.rewardLabel} {selectedTask.rewardXp} XP
+                      </div>
+                    </div>
+
+                    <p className="text-slate-600 dark:text-slate-300 text-xs leading-relaxed mb-6 bg-slate-50 dark:bg-[#201b3a] p-4 border border-slate-100 dark:border-[#2d2553]/50 rounded-xl">
+                      <strong>{t.assignmentPrompt}</strong> {selectedTask.description}
+                    </p>
+
+                    {/* DRAG AND DROP MATCHING CHALLENGE TYPE */}
+                    {selectedTask.type === 'dragdrop' && (
+                      <div className="space-y-6">
+                        <div className="p-4 bg-violet-50 dark:bg-violet-950/20 border border-violet-100 dark:border-violet-900/40 rounded-2xl flex items-center gap-3">
+                          <Info className="h-5 w-5 text-violet-500 shrink-0" />
+                          <p className="text-[11px] text-violet-700 dark:text-violet-300 leading-relaxed">
+                            <strong>{t.interactiveMode}</strong> {t.dragDropInstructions}
+                          </p>
+                        </div>
+
+                        {/* Drag Items source blocks */}
+                        <div className="space-y-2">
+                          <span className="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-wide">{t.technologyElements}</span>
+                          <div className="flex flex-wrap gap-3">
+                            {(selectedTask.dragItems || []).map((dragVal) => {
+                              // If already matched, we hide or styled as disabled
+                              const isMatched = Object.values(matchedPairings).includes(dragVal);
+                              return (
+                                <div
+                                  key={dragVal}
+                                  draggable={!isMatched}
+                                  onDragStart={() => handleDragStart(dragVal)}
+                                  className={`px-4 py-2.5 rounded-xl font-bold text-xs border transition-all select-none shadow-xs ${
+                                    isMatched 
+                                      ? "bg-slate-100 dark:bg-[#1c1836]/60 border-slate-200 dark:border-[#251e40] text-slate-400 dark:text-slate-600 cursor-not-allowed" 
+                                      : "bg-white dark:bg-[#1c1836] border-slate-200 dark:border-[#2b244c] text-slate-800 dark:text-slate-100 hover:border-indigo-400 hover:shadow-indigo-50 cursor-grab active:cursor-grabbing"
+                                  }`}
+                                >
+                                  {dragVal}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+
+                        {/* Drop Zones container targets */}
+                        <div className="space-y-3">
+                          <span className="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-wide">{t.targetRoleCategories}</span>
+                          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                            {(selectedTask.dropZones || []).map((zoneVal) => {
+                              const pairedVal = matchedPairings[zoneVal];
+                              return (
+                                <div
+                                  key={zoneVal}
+                                  onDragOver={(e) => e.preventDefault()}
+                                  onDrop={() => handleDrop(zoneVal)}
+                                  className={`p-5 rounded-2xl border-2 border-dashed flex flex-col items-center justify-center text-center gap-3 min-h-[120px] transition-all ${
+                                    pairedVal 
+                                      ? "bg-indigo-50/30 dark:bg-indigo-950/20 border-indigo-300 dark:border-indigo-500/30" 
+                                      : "bg-slate-50 dark:bg-[#201b3a] border-slate-200 dark:border-[#2b244c] hover:bg-slate-100/50 dark:hover:bg-[#282154] hover:border-slate-300 dark:hover:border-indigo-500/30"
+                                  }`}
+                                >
+                                  <span className="text-[10px] text-slate-400 dark:text-slate-400 font-medium max-w-[150px]">
+                                    {zoneVal}
+                                  </span>
+                                  {pairedVal ? (
+                                    <div className="px-3 py-1.5 bg-indigo-600 text-white rounded-lg font-bold text-xs shadow-xs animate-bounce">
+                                      {pairedVal}
+                                    </div>
+                                  ) : (
+                                    <span className="text-[9px] text-slate-400 dark:text-slate-500 font-mono font-bold tracking-wider uppercase">
+                                      {t.dropElementHere}
+                                    </span>
+                                  )}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+
+                        {/* Actions feedback section */}
+                        {dragDropFeedback && (
+                          <div className={`p-4 rounded-xl border text-xs font-bold ${
+                            dragDropFeedback.success 
+                              ? "bg-emerald-50 dark:bg-emerald-950/20 border-emerald-100 dark:border-emerald-900/30 text-emerald-700 dark:text-emerald-400" 
+                              : "bg-rose-50 dark:bg-rose-950/20 border-rose-100 dark:border-rose-900/30 text-rose-700 dark:text-rose-400"
+                          }`}>
+                            {dragDropFeedback.text}
+                          </div>
+                        )}
+
+                        <div className="flex gap-3">
+                          <button
+                            onClick={handleCheckDragDrop}
+                            disabled={Object.keys(matchedPairings).length < (selectedTask.dropZones || []).length || dragDropFeedback?.success}
+                            className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-200 text-white font-bold text-xs rounded-xl shadow-md disabled:shadow-none transition-all cursor-pointer"
+                          >
+                            {t.checkMatch}
+                          </button>
+                          <button
+                            onClick={handleResetDragDrop}
+                            className="px-4 py-2 bg-white dark:bg-[#1c1836] border border-slate-200 dark:border-[#2b244c] hover:bg-slate-50 dark:hover:bg-[#282154] text-slate-600 dark:text-slate-300 font-bold text-xs rounded-xl transition-all"
+                          >
+                            {t.resetBoard}
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* WRITTEN ESSAY/TEXT ANSWER SUBMISSION TYPE */}
+                    {selectedTask.type === 'text' && (
+                      <form onSubmit={handleTextHomeworkSubmit} className="space-y-4">
+                        <div>
+                          <label className="block text-xs font-bold text-slate-400 uppercase tracking-wider mb-1.5">
+                            {t.feedback}
+                          </label>
+                          <textarea
+                            required
+                            rows={6}
+                            placeholder={t.homeworkPlaceholder}
+                            value={homeworkText}
+                            onChange={(e) => setHomeworkText(e.target.value)}
+                            className="w-full p-4 bg-slate-50 dark:bg-[#201b3a] border border-slate-200 dark:border-[#2d2553]/50 focus:border-indigo-500 rounded-2xl focus:outline-hidden text-slate-700 dark:text-slate-200 text-sm leading-relaxed"
+                          />
+                        </div>
+
+                        <button
+                          type="submit"
+                          disabled={submittingTask || !homeworkText.trim()}
+                          className="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-200 text-white font-bold text-xs rounded-xl shadow-md transition-all flex items-center gap-1.5"
+                        >
+                          {submittingTask ? (
+                            <>
+                              <RefreshCw className="h-4 w-4 animate-spin" /> {t.handingIn}
+                            </>
+                          ) : (
+                            <>
+                              <CheckCircle2 className="h-4 w-4" /> {t.handInAssignment} (+{selectedTask.rewardXp} {t.xpMaxSuffix})
+                            </>
+                          )}
+                        </button>
+                      </form>
+                    )}
+
+                    {selectedTask.type === 'quiz' && selectedTask.quizQuestions && (
+                      <div className="space-y-5">
+                        {selectedTask.quizQuestions.map((q, qi) => {
+                          const chosen = quizAnswers[qi];
+                          const graded = quizResult != null;
+                          return (
+                            <div key={qi} className="p-4 bg-slate-50 dark:bg-[#201b3a] border border-slate-200 dark:border-[#2d2553]/50 rounded-2xl">
+                              <p className="text-sm font-bold text-slate-800 dark:text-slate-100 mb-3">
+                                <span className="text-indigo-500">{qi + 1}.</span> {q.question}
+                              </p>
+                              <div className="space-y-2">
+                                {q.options.map((opt, oi) => {
+                                  const isChosen = chosen === oi;
+                                  const isCorrect = q.correctIndex === oi;
+                                  let cls = "border-slate-200 dark:border-[#2d2553]/60 hover:border-indigo-300";
+                                  if (graded && isCorrect) cls = "border-emerald-400 bg-emerald-50 dark:bg-emerald-950/30";
+                                  else if (graded && isChosen && !isCorrect) cls = "border-red-400 bg-red-50 dark:bg-red-950/30";
+                                  else if (isChosen) cls = "border-indigo-400 bg-indigo-50 dark:bg-indigo-950/30";
+                                  return (
+                                    <button
+                                      key={oi}
+                                      type="button"
+                                      disabled={graded}
+                                      onClick={() => setQuizAnswers(prev => ({ ...prev, [qi]: oi }))}
+                                      className={`w-full text-left flex items-center gap-2.5 px-3 py-2.5 rounded-xl border text-xs font-semibold text-slate-700 dark:text-slate-200 transition-all cursor-pointer disabled:cursor-default ${cls}`}
+                                    >
+                                      <span className={`w-4 h-4 rounded-full border-2 shrink-0 ${isChosen ? "bg-indigo-500 border-indigo-500" : "border-slate-300 dark:border-slate-600"}`} />
+                                      {opt}
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                          );
+                        })}
+
+                        {quizResult ? (
+                          <div className="p-4 bg-indigo-50 dark:bg-indigo-950/30 border border-indigo-200 dark:border-indigo-500/30 rounded-2xl text-center">
+                            <p className="text-sm font-bold text-indigo-700 dark:text-indigo-300">
+                              {t.quizScore} {quizResult.correct}/{quizResult.total} — +{quizResult.xp} XP 🎉
+                            </p>
+                          </div>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={handleSubmitQuiz}
+                            disabled={Object.keys(quizAnswers).length < selectedTask.quizQuestions.length}
+                            className="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-200 dark:disabled:bg-slate-700 text-white font-bold text-xs rounded-xl shadow-md transition-all flex items-center gap-1.5 cursor-pointer disabled:cursor-not-allowed"
+                          >
+                            <CheckCircle2 className="h-4 w-4" /> {t.quizSubmit} (+{selectedTask.rewardXp} {t.xpMaxSuffix})
+                          </button>
+                        )}
+                      </div>
+                    )}
+                  </motion.div>
+                )}
+              </div>
+              );
+            })()}
+
+            {/* PEER DISCUSS CHAT ROOM TAB */}
+            {activeTab === "chat" && (
+              <div className="bg-white dark:bg-[#18142c] border border-slate-200 dark:border-[#2b244c] rounded-3xl flex flex-col h-[70vh] md:h-[calc(100vh-160px)]">
+                
+                {/* Chat header channel summary */}
+                <div className="p-4 border-b border-slate-100 dark:border-[#251e40] flex items-center justify-between bg-slate-50/50 dark:bg-[#201b3a]/50 rounded-t-3xl">
+                  <div className="flex items-center gap-2">
+                    <div className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse" />
+                    <div>
+                      <h3 className="font-bold text-xs text-slate-800 dark:text-slate-200">#{activeClass.code}-community-chat</h3>
+                      <p className="text-[10px] text-slate-400 mt-0.5">{t.chatChannelDesc}</p>
+                    </div>
+                  </div>
+                  <span className="text-[9px] font-bold text-slate-400 font-mono">{classStudents.length} {t.activePeers}</span>
+                </div>
+
+                {/* Message display thread — WhatsApp-style: date chips, grouped
+                    senders, time inside the bubble */}
+                <div className="flex-1 p-4 overflow-y-auto bg-slate-100/70 dark:bg-[#120f22]">
+                  {classMessages.map((msg, i) => {
+                    const isSelf = msg.senderId === currentStudent.id;
+                    const isTeacher = msg.senderRole === 'teacher';
+                    const prev = classMessages[i - 1];
+                    const newDay = !prev || new Date(prev.timestamp).toDateString() !== new Date(msg.timestamp).toDateString();
+                    const grouped = !newDay && prev && prev.senderId === msg.senderId;
+                    const d = new Date(msg.timestamp);
+                    const today = new Date();
+                    const yest = new Date(Date.now() - 864e5);
+                    const dayLabel = d.toDateString() === today.toDateString() ? t.chatToday
+                      : d.toDateString() === yest.toDateString() ? t.chatYesterday
+                      : d.toLocaleDateString();
+                    const time = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                    return (
+                      <React.Fragment key={msg.id}>
+                        {newDay && (
+                          <div className="flex justify-center py-2.5">
+                            <span className="px-3 py-1 bg-white dark:bg-[#251e40] text-slate-500 dark:text-slate-400 text-[9px] font-bold rounded-lg shadow-xs">
+                              {dayLabel}
+                            </span>
+                          </div>
+                        )}
+                        <div className={`flex items-end gap-2 ${isSelf ? "justify-end" : "justify-start"} ${grouped ? "mt-0.5" : "mt-3"}`}>
+                          {!isSelf && (grouped ? (
+                            <div className="w-7 shrink-0" />
+                          ) : (
+                            <img
+                              src={msg.senderAvatar}
+                              alt={msg.senderName}
+                              className="w-7 h-7 rounded-full bg-slate-100 shrink-0 border border-slate-200 dark:border-[#2b244c]"
+                            />
+                          ))}
+                          <div className={`max-w-[75%] px-3 py-2 text-xs leading-relaxed shadow-xs ${
+                            isSelf
+                              ? "bg-indigo-600 text-white rounded-2xl rounded-br-md"
+                              : "bg-white dark:bg-[#221c3f] text-slate-800 dark:text-slate-200 rounded-2xl rounded-bl-md"
+                          }`}>
+                            {!isSelf && !grouped && (
+                              <div className={`text-[10px] font-bold mb-0.5 ${isTeacher ? "text-violet-500" : "text-indigo-400"}`}>
+                                {msg.senderName}{isTeacher ? ` · ${t.teacherRole}` : ""}
+                              </div>
+                            )}
+                            <span className="break-words">{msg.text}</span>
+                            <span className={`text-[8px] font-mono ms-2 whitespace-nowrap ${isSelf ? "text-indigo-200" : "text-slate-400"}`}>
+                              {time}
+                            </span>
+                          </div>
+                        </div>
+                      </React.Fragment>
+                    );
+                  })}
+                  <div ref={chatBottomRef} />
+                </div>
+
+                {/* Chat message inputs */}
+                <form onSubmit={handleSendChat} className="p-4 border-t border-slate-100 dark:border-[#251e40] bg-slate-50/50 dark:bg-[#201b3a]/50 rounded-b-3xl flex gap-2">
+                  <input
+                    type="text"
+                    required
+                    placeholder={`${t.messageChannelPrefix} #${activeClass.code}-community-chat...`}
+                    value={chatInput}
+                    onChange={(e) => setChatInput(e.target.value)}
+                    className="flex-1 px-4 py-2.5 bg-white dark:bg-[#1c1836] border border-slate-200 dark:border-[#2b244c] focus:border-indigo-500 rounded-full focus:outline-hidden text-xs text-slate-700 dark:text-slate-200"
+                  />
+                  <button
+                    type="submit"
+                    aria-label={t.messageChannelPrefix}
+                    className="p-3 bg-indigo-600 hover:bg-indigo-500 text-white rounded-full shadow-md shadow-indigo-100 dark:shadow-none transition-all flex items-center justify-center cursor-pointer"
+                  >
+                    <Send className="h-4 w-4" />
+                  </button>
+                </form>
+
+              </div>
+            )}
+
+            {/* STUDY BUDDY AI CHAT TAB */}
+            {activeTab === "ai" && (
+              <div className="bg-white dark:bg-[#18142c] border border-slate-200 dark:border-[#2b244c] rounded-3xl flex flex-col h-[70vh] md:h-[calc(100vh-160px)] shadow-xs">
+                
+                {/* AI banner */}
+                <div className="p-4 border-b border-slate-100 dark:border-[#251e40] flex items-center justify-between bg-gradient-to-r from-indigo-50/80 dark:from-indigo-950/20 to-violet-50/80 dark:to-violet-950/20 rounded-t-3xl">
+                  <div className="flex items-center gap-2.5">
+                    <div className="p-1.5 bg-gradient-to-tr from-indigo-500 to-violet-600 text-white rounded-lg shadow-sm">
+                      <Sparkles className="h-4 w-4" />
+                    </div>
+                    <div>
+                      <h3 className="font-bold text-xs text-indigo-900 dark:text-indigo-100">{t.insyteAiTutor}</h3>
+                      <p className="text-[10px] text-indigo-700 dark:text-indigo-300 mt-0.5">{t.aiTutorDesc}</p>
+                    </div>
+                  </div>
+                  <span className="bg-indigo-100 dark:bg-indigo-950/40 text-indigo-700 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-800/40 text-[8px] font-bold px-2 py-0.5 rounded-full uppercase tracking-wider font-mono">
+                    Gemini 3.5-flash
+                  </span>
+                </div>
+
+                {/* AI chat thread view */}
+                <div className="flex-1 p-5 overflow-y-auto space-y-5 bg-slate-50/20">
+                  {aiChat.map((msg, idx) => {
+                    const isAi = msg.role === "assistant";
+                    return (
+                      <div 
+                        key={idx}
+                        className={`flex gap-3.5 max-w-2xl ${isAi ? "mr-auto text-left" : "ml-auto flex-row-reverse text-right"}`}
+                      >
+                        <div className={`w-8.5 h-8.5 rounded-full flex items-center justify-center border shrink-0 ${
+                          isAi 
+                            ? "bg-gradient-to-tr from-indigo-500 to-violet-600 text-white border-indigo-200" 
+                            : "bg-slate-200 dark:bg-slate-700 text-slate-600 dark:text-slate-300 border border-slate-300 dark:border-slate-600"
+                        }`}>
+                          {isAi ? <Sparkles className="h-4.5 w-4.5" /> : currentStudent.name[0]}
+                        </div>
+                        <div>
+                          <div className={`text-[9px] text-slate-400 flex items-center gap-1.5 font-mono mb-1 ${isAi ? "justify-start" : "justify-end"}`}>
+                            <span>{isAi ? t.insyteAiTutorCaps : currentStudent.name.toUpperCase()}</span>
+                          </div>
+
+                          <div className={`p-4 rounded-2xl text-xs leading-relaxed inline-block ${
+                            isAi 
+                              ? "bg-white dark:bg-[#201b3a] text-slate-800 dark:text-slate-200 border border-slate-100 dark:border-[#2d2553]/50 rounded-tl-none shadow-xs whitespace-pre-wrap" 
+                              : "bg-indigo-600 text-white rounded-tr-none shadow-xs text-left"
+                          }`}>
+                            {msg.text}
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+
+                  {/* AI Generating Animation */}
+                  {aiLoading && (
+                    <div className="flex gap-3.5 max-w-2xl mr-auto text-left">
+                      <div className="w-8.5 h-8.5 rounded-full flex items-center justify-center bg-gradient-to-tr from-indigo-500 to-violet-600 text-white border border-indigo-200">
+                        <Sparkles className="h-4.5 w-4.5 animate-spin" />
+                      </div>
+                      <div>
+                        <div className="text-[9px] text-slate-400 font-mono mb-1">{t.insyteAiTutorCaps}</div>
+                        <div className="p-4 bg-white dark:bg-[#201b3a] text-slate-800 dark:text-slate-200 border border-slate-100 dark:border-[#2d2553]/50 rounded-2xl rounded-tl-none shadow-xs flex items-center gap-2">
+                          <span className="w-1.5 h-1.5 bg-indigo-500 rounded-full animate-bounce" />
+                          <span className="w-1.5 h-1.5 bg-indigo-500 rounded-full animate-bounce [animation-delay:0.2s]" />
+                          <span className="w-1.5 h-1.5 bg-indigo-500 rounded-full animate-bounce [animation-delay:0.4s]" />
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  <div ref={aiBottomRef} />
+                </div>
+
+                {/* AI input form submission */}
+                <form onSubmit={handleAskAi} className="p-4 border-t border-slate-100 dark:border-[#251e40] bg-slate-50/50 dark:bg-[#201b3a]/50 rounded-b-3xl flex gap-2">
+                  <input
+                    type="text"
+                    required
+                    disabled={aiLoading}
+                    placeholder={t.aiInputPlaceholder}
+                    value={aiInput}
+                    onChange={(e) => setAiInput(e.target.value)}
+                    className="flex-1 px-4 py-2.5 bg-white dark:bg-[#1c1836] border border-slate-200 dark:border-[#2b244c] focus:border-indigo-500 rounded-xl focus:outline-hidden text-xs text-slate-700 dark:text-slate-200 disabled:bg-slate-100 dark:disabled:bg-[#1c1836]/40"
+                  />
+                  <button
+                    type="submit"
+                    disabled={aiLoading || !aiInput.trim()}
+                    className="px-4 py-2 bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-500 hover:to-violet-500 disabled:bg-slate-200 text-white rounded-xl shadow-md transition-all flex items-center justify-center gap-1 cursor-pointer font-bold text-xs"
+                  >
+                    <Send className="h-4 w-4" />
+                    <span>{t.askAiBtn}</span>
+                  </button>
+                </form>
+
+              </div>
+            )}
+
+            {/* CALENDAR TAB */}
+            {activeTab === "calendar" && (
+              <InteractiveCalendar 
+                classes={classes}
+                tasks={tasks}
+                events={events}
+                submissions={submissions}
+                currentStudentId={currentStudent.id}
+                language={language}
+              />
+            )}
+
+            {/* MAIL TAB */}
+            {activeTab === "mail" && (
+              <MailPanel
+                currentUser={currentStudent}
+                mails={mails}
+                contacts={[
+                  ...allTeachers.filter(te => studentClasses.some(c => c.teacherId === te.id)),
+                  ...allStudents.filter(s =>
+                    s.id !== currentStudent.id &&
+                    s.joinedClasses.some(cid => currentStudent.joinedClasses.includes(cid))
+                  )
+                ]}
+                onSendMail={onSendMail}
+                onMarkMailRead={onMarkMailRead}
+                language={language}
+              />
+            )}
+
+            {/* SETTINGS TAB */}
+            {activeTab === "settings" && (
+              <SettingsTab
+                language={language}
+                user={currentStudent}
+                userRole="student"
+                onLogOut={onLogOut}
+                onUpdateAvatar={onUpdateAvatar}
+              />
+            )}
+
+          </main>
+
+
+        </div>
+      ) : (
+        // Not enrolled in any class yet — still give access to Join, Mail, Settings
+        <div className="flex-1 flex flex-col md:flex-row md:h-[calc(100vh-73px)]">
+          {menuOpen && (
+            <div className="md:hidden fixed inset-0 z-40 bg-slate-900/50 backdrop-blur-sm" onClick={() => setMenuOpen(false)} />
+          )}
+          <aside
+            onClick={() => setMenuOpen(false)}
+            className={`mobile-drawer ${menuOpen ? "open" : ""} md:static md:w-64 bg-white dark:bg-[#130f26] md:border-r border-slate-200 dark:border-[#241c49]/80 p-3 md:p-4 flex flex-col gap-1.5 overflow-y-auto shrink-0`}
+          >
+            <div className="md:hidden flex items-center gap-2 pb-3 mb-1 border-b border-slate-200 dark:border-[#241c49]" onClick={(e) => e.stopPropagation()}>
+              <NotificationBell
+                inDrawer
+                notifications={notifications}
+                onMarkAllRead={onMarkNotificationsRead}
+                emptyLabel={t.noNotifications}
+                title={t.notificationsTitle}
+                markReadLabel={t.markAllRead}
+              />
+              <NavbarControls language={language} setLanguage={setLanguage} theme={theme} setTheme={setTheme} />
+            </div>
+            <button
+              onClick={() => setJoinOpen(true)}
+              className="w-auto md:w-full shrink-0 flex items-center gap-2.5 px-3.5 md:px-4 py-2.5 md:py-3 rounded-xl text-xs font-bold text-indigo-600 dark:text-indigo-400 bg-indigo-50 dark:bg-indigo-950/30 hover:bg-indigo-100 dark:hover:bg-indigo-950/50 border border-indigo-200/60 dark:border-indigo-500/20 cursor-pointer"
+            >
+              <UserPlus className="h-4 w-4" /> {t.joinCommunity}
+            </button>
+            <button
+              onClick={() => setNoClassTab("mail")}
+              className={`w-auto md:w-full shrink-0 flex items-center gap-2.5 px-3.5 md:px-4 py-2.5 md:py-3 rounded-xl text-xs font-bold cursor-pointer ${noClassTab === "mail" ? "bg-slate-100 dark:bg-[#1c1836] text-slate-900 dark:text-slate-100" : "text-slate-500 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-[#1c1836]/40"}`}
+            >
+              <MailLucide className="h-4 w-4" /> {t.mailTab}
+            </button>
+            <button
+              onClick={() => setNoClassTab("settings")}
+              className={`w-auto md:w-full shrink-0 flex items-center gap-2.5 px-3.5 md:px-4 py-2.5 md:py-3 rounded-xl text-xs font-bold cursor-pointer ${noClassTab === "settings" ? "bg-slate-100 dark:bg-[#1c1836] text-slate-900 dark:text-slate-100" : "text-slate-500 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-[#1c1836]/40"}`}
+            >
+              <Settings className="h-4 w-4" /> {t.settings}
+            </button>
+          </aside>
+
+          <main className="flex-1 bg-slate-50/50 dark:bg-slate-900/50 p-4 sm:p-6 overflow-y-auto">
+            {noClassTab === "mail" ? (
+              <MailPanel
+                currentUser={currentStudent}
+                mails={mails}
+                contacts={allTeachers.filter(te => te.id !== currentStudent.id)}
+                onSendMail={onSendMail}
+                onMarkMailRead={onMarkMailRead}
+                language={language}
+              />
+            ) : noClassTab === "settings" ? (
+              <SettingsTab language={language} user={currentStudent} userRole="student" onLogOut={onLogOut} onUpdateAvatar={onUpdateAvatar} />
+            ) : (
+              <div className="h-full flex items-center justify-center text-center">
+                <div>
+                  <ShieldAlert className="h-10 w-10 text-slate-400 mx-auto" />
+                  <h3 className="font-bold text-slate-700 dark:text-slate-200 mt-3 text-sm">{t.notEnrolled}</h3>
+                  <p className="text-slate-400 text-xs mt-1">{t.noClassesYet}</p>
+                  <button
+                    onClick={() => setJoinOpen(true)}
+                    className="mt-5 inline-flex items-center gap-2 px-5 py-3 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold transition-all cursor-pointer shadow-md"
+                  >
+                    <UserPlus className="h-4 w-4" /> {t.joinCommunity}
+                  </button>
+                </div>
+              </div>
+            )}
+          </main>
+        </div>
+      )}
+
+      {/* Join Class Modal */}
+      <AnimatePresence>
+        {joinOpen && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4"
+            onClick={() => setJoinOpen(false)}
+          >
+            <motion.div
+              initial={{ scale: 0.95, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.95, opacity: 0 }}
+              onClick={(e) => e.stopPropagation()}
+              className="bg-white dark:bg-[#130f26] border border-slate-200 dark:border-[#241c49] rounded-2xl p-6 w-full max-w-sm shadow-2xl"
+            >
+              <div className="flex items-center gap-3 mb-3">
+                <div className="p-2.5 bg-indigo-50 dark:bg-indigo-950/40 text-indigo-500 rounded-xl">
+                  <UserPlus className="h-5 w-5" />
+                </div>
+                <h3 className="font-bold text-base text-slate-800 dark:text-slate-100">{t.joinClassTitle}</h3>
+              </div>
+              <p className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed mb-4">
+                {t.joinClassDesc}
+              </p>
+              <form onSubmit={handleJoinSubmit} className="space-y-3">
+                <input
+                  type="text"
+                  required
+                  autoFocus
+                  placeholder={t.classCodePlaceholder}
+                  value={joinCode}
+                  onChange={(e) => setJoinCode(e.target.value)}
+                  className="w-full px-4 py-3 bg-slate-50 dark:bg-[#1c1836] border border-slate-200 dark:border-[#2d2553] focus:border-indigo-500 rounded-xl focus:outline-hidden text-sm font-mono uppercase tracking-widest text-slate-800 dark:text-slate-100"
+                />
+                {joinError && <p className="text-red-500 text-xs font-semibold">{joinError}</p>}
+                <div className="flex items-center gap-3">
+                  <button
+                    type="button"
+                    onClick={() => setJoinOpen(false)}
+                    className="flex-1 px-4 py-2.5 rounded-xl text-xs font-bold bg-slate-100 dark:bg-[#1c1836] text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-[#282154] transition-all cursor-pointer"
+                  >
+                    {t.cancel}
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={joining}
+                    className="flex-1 px-4 py-2.5 rounded-xl text-xs font-bold bg-indigo-600 text-white hover:bg-indigo-500 disabled:opacity-50 transition-all cursor-pointer"
+                  >
+                    {t.joinBtn}
+                  </button>
+                </div>
+              </form>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Leave Class Confirmation Modal */}
+      <AnimatePresence>
+        {leaveConfirm && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4"
+            onClick={() => setLeaveConfirm(null)}
+          >
+            <motion.div
+              initial={{ scale: 0.95, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.95, opacity: 0 }}
+              onClick={(e) => e.stopPropagation()}
+              className="bg-white dark:bg-[#130f26] border border-slate-200 dark:border-[#241c49] rounded-2xl p-6 w-full max-w-sm shadow-2xl"
+            >
+              <div className="flex items-center gap-3 mb-3">
+                <div className="p-2.5 bg-red-50 dark:bg-red-950/40 text-red-500 rounded-xl">
+                  <LogOut className="h-5 w-5" />
+                </div>
+                <h3 className="font-bold text-base text-slate-800 dark:text-slate-100">{t.leaveClass}</h3>
+              </div>
+              <p className="text-sm text-slate-500 dark:text-slate-400 leading-relaxed">
+                {t.leaveClassConfirm} <span className="font-bold text-slate-700 dark:text-slate-200">{leaveConfirm.name}</span>?
+              </p>
+              <div className="flex items-center gap-3 mt-6">
+                <button
+                  onClick={() => setLeaveConfirm(null)}
+                  className="flex-1 px-4 py-2.5 rounded-xl text-xs font-bold bg-slate-100 dark:bg-[#1c1836] text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-[#282154] transition-all cursor-pointer"
+                >
+                  {t.cancel}
+                </button>
+                <button
+                  onClick={confirmLeaveClass}
+                  className="flex-1 px-4 py-2.5 rounded-xl text-xs font-bold bg-red-500 text-white hover:bg-red-600 transition-all cursor-pointer"
+                >
+                  {t.leaveClass}
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+    </div>
+  );
+};
